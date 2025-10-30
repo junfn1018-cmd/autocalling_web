@@ -10,6 +10,8 @@ import itertools
 
 # ====================================================데이터 정의=====================================================
 WINDOW_SIZE = 31
+COLORS = ['blue', 'green', 'black', 'red']
+CHANNEL_KEYS = ['DATA9', 'DATA10', 'DATA11', 'DATA12']
 
 all_best_params = {
     'P1_blue': {'k_blue': 1.392833480861528, 'c_blue': -219},
@@ -70,9 +72,6 @@ mutation_map = pd.DataFrame([
 
 
 def create_moving_avg_std_cutoffs(signal, window_size, k):
-    """
-    signalInput signal array to analyze분석할 입력 신호 배열window_sizeSize of the sliding window for calculating local statistics지역 통계를 계산하기 위한 슬라이딩 윈도우 크기kMultiplier for standard deviation (higher k = stricter cutoff)표준편차 배수 (k가 클수록 더 엄격한 컷오프)ReturnsArray of cutoff values for each position in the signal신호의 각 위치에 대한 컷오프 값 배열
-    """
     half_window = window_size // 2
     padded = np.pad(signal, (half_window, half_window), mode='reflect')
     cutoff = np.zeros_like(signal, dtype=float)
@@ -81,47 +80,37 @@ def create_moving_avg_std_cutoffs(signal, window_size, k):
     return cutoff
 
 
-def detect_peaks(filepath, best_params_dict, return_cutoff=False):
-    record = SeqIO.read(filepath, "abi")
-    size_pred = np.array(record.annotations['abif_raw']['SMap2'], dtype=float)
+def _read_record(filepath):
+    # BioPython이 FSA도 ABI 리더로 처리 가능하다는 전제 유지
+    return SeqIO.read(filepath, "abi")
 
-    raw_channels = {
-        "blue": np.array(record.annotations['abif_raw']["DATA9"], dtype=float),
-        "green": np.array(record.annotations['abif_raw']["DATA10"], dtype=float),
-        "black": np.array(record.annotations['abif_raw']["DATA11"], dtype=float),
-        "red": np.array(record.annotations['abif_raw']["DATA12"], dtype=float)
-    }
 
-    all_peaks, cutoff_lines = [], {}
+def _get_size_pred(record):
+    return np.array(record.annotations['abif_raw']['SMap2'], dtype=float)
 
-    for ind, (color, raw_signal) in enumerate(raw_channels.items()):
-        smoothed_signal = uniform_filter1d(raw_signal, 7)
-        global_mean, global_std = np.mean(smoothed_signal), np.std(smoothed_signal)
 
-        final_cutoff_line = np.full_like(smoothed_signal, max(global_mean + 1.5 * global_std, 300))
+def _get_raw_channels(record):
+    channels = {}
+    for color, key in zip(COLORS, CHANNEL_KEYS):
+        channels[color] = np.array(record.annotations['abif_raw'][key], dtype=float)
+    return channels
 
-        peaks, _ = find_peaks(smoothed_signal, height=final_cutoff_line)
-        for idx in peaks:
-            all_peaks.append((color, size_pred[idx], smoothed_signal[idx]))
 
-        cutoff_lines[color] = (size_pred, final_cutoff_line)
+def _detect_peaks_generic(filepath, best_params_dict, mode="test", return_cutoff=False):
+    """
+    mode: "test" | "control"
+    - test: 기존 detect_peaks 동작 (global baseline 300)
+    - control: 기존 detect_peaks_control 동작 (k/c/dynamic, baseline >= 500)
+    """
+    record = _read_record(filepath)
+    size_pred = _get_size_pred(record)
+    raw_channels = _get_raw_channels(record)
 
-    if return_cutoff:
-        return all_peaks, cutoff_lines
-    return all_peaks
+    # 패널 추정 (기존 startswith("s1") 보완)
+    path_lower = filepath.lower()
+    is_panel1 = (path_lower.startswith("s1") or "/s1/" in path_lower or "s1-" in path_lower or "panel1" in path_lower)
 
-def detect_peaks_control(filepath, best_params_dict, return_cutoff=False):
-    WINDOW_SIZE = 31
-    record = SeqIO.read(filepath, "abi")
-    size_pred = np.array(record.annotations['abif_raw']['SMap2'], dtype=float)
-
-    raw_channels = {
-        "blue": np.array(record.annotations['abif_raw']["DATA9"], dtype=float),
-        "green": np.array(record.annotations['abif_raw']["DATA10"], dtype=float),
-        "black": np.array(record.annotations['abif_raw']["DATA11"], dtype=float),
-        "red": np.array(record.annotations['abif_raw']["DATA12"], dtype=float)
-    }
-
+    # K/C factors
     K_FACTORS_P1 = [best_params_dict['P1_blue']['k_blue'], best_params_dict['P1_green']['k_green'],
                     best_params_dict['P1_black']['k_black'], best_params_dict['P1_red']['k_red']]
     C_FACTORS_P1 = [best_params_dict['P1_blue']['c_blue'], best_params_dict['P1_green']['c_green'],
@@ -137,19 +126,23 @@ def detect_peaks_control(filepath, best_params_dict, return_cutoff=False):
         smoothed_signal = uniform_filter1d(raw_signal, 7)
         global_mean, global_std = np.mean(smoothed_signal), np.std(smoothed_signal)
 
-        if filepath.startswith("s1"):
-            k, c = K_FACTORS_P1[ind], C_FACTORS_P1[ind]
+        if mode == "control":
+            if is_panel1:
+                k, c = K_FACTORS_P1[ind], C_FACTORS_P1[ind]
+            else:
+                k, c = K_FACTORS_P2[ind], C_FACTORS_P2[ind]
+
+            global_baseline = max(c + global_mean + k * global_std, 500)
+            dynamic_line = create_moving_avg_std_cutoffs(smoothed_signal, WINDOW_SIZE, k)
+            final_cutoff_line = np.maximum(global_baseline, dynamic_line)
+            peaks, _ = find_peaks(smoothed_signal, height=final_cutoff_line, distance=20, prominence=100)
         else:
-            k, c = K_FACTORS_P2[ind], C_FACTORS_P2[ind]
+            # test 모드: 기존 로직 유지
+            final_cutoff_line = np.full_like(smoothed_signal, max(global_mean + 1.5 * global_std, 300))
+            peaks, _ = find_peaks(smoothed_signal, height=final_cutoff_line)
 
-        global_baseline = max(c + global_mean + k * global_std, 500)
-        dynamic_line = create_moving_avg_std_cutoffs(smoothed_signal, WINDOW_SIZE, k)
-        final_cutoff_line = np.maximum(global_baseline, dynamic_line)
-
-        peaks, _ = find_peaks(smoothed_signal, height=final_cutoff_line, distance=20, prominence=100)
         for idx in peaks:
             all_peaks.append((color, size_pred[idx], smoothed_signal[idx]))
-
         cutoff_lines[color] = (size_pred, final_cutoff_line)
 
     if return_cutoff:
@@ -157,10 +150,18 @@ def detect_peaks_control(filepath, best_params_dict, return_cutoff=False):
     return all_peaks
 
 
+def detect_peaks(filepath, best_params_dict, return_cutoff=False):
+    return _detect_peaks_generic(filepath, best_params_dict, mode="test", return_cutoff=return_cutoff)
+
+def detect_peaks_control(filepath, best_params_dict, return_cutoff=False):
+    return _detect_peaks_generic(filepath, best_params_dict, mode="control", return_cutoff=return_cutoff)
+
+
 def get_windows(file_path, best_params, mutation_map, window_size=2, iscontrol = False):
     if iscontrol:
         peaks = detect_peaks_control(file_path, best_params)
     else:
+        # 오타 수정: best_parms -> best_params
         peaks = detect_peaks(file_path, best_params)
 
     windows = []
@@ -253,8 +254,6 @@ def get_control_peak_positions(control_path, best_params, control_windows, mutat
     peaks = sorted(peaks, key=lambda x: x[1])
     
     control_positions = []
-
-    # print(f"control position : {control_positions}")
     
     for idx, (s, e) in enumerate(control_windows):
         in_window = [(c, p, inten) for c, p, inten in peaks if s <= p <= e]
@@ -293,18 +292,15 @@ def get_control_peak_positions(control_path, best_params, control_windows, mutat
 
 
 def show_with_windows(file_path, best_params, windows=None, title="Test panel", mutation_map=None, visual=False):
-    record = SeqIO.read(file_path, "abi")
-    size_pred = np.array(record.annotations['abif_raw']['SMap2'], dtype=float)
-
-    colors = ['blue', 'green', 'black', 'red']
-    channels = ['DATA9', 'DATA10', 'DATA11', 'DATA12']
+    record = _read_record(file_path)
+    size_pred = _get_size_pred(record)
 
     if visual:
         plt.figure(figsize=(20, 8))
 
         trace = {}
-        for channel, color in zip(channels, colors):
-            raw = np.array(record.annotations['abif_raw'][channel], dtype=float)
+        for color, key in zip(COLORS, CHANNEL_KEYS):
+            raw = np.array(record.annotations['abif_raw'][key], dtype=float)
             trace[color] = uniform_filter1d(raw, 7)
             plt.plot(size_pred, trace[color], color=color, label=f"{color}")
 
@@ -330,12 +326,8 @@ def show_with_windows(file_path, best_params, windows=None, title="Test panel", 
 
         return peaks
     else:
-        trace = {}
-        for channel, color in zip(channels, colors):
-            raw = np.array(record.annotations['abif_raw'][channel], dtype=float)
-            trace[color] = uniform_filter1d(raw, 7)
-        peaks = detect_peaks(file_path, best_params)
-        return peaks
+        # 시각화가 아닐 때는 피크만 반환
+        return detect_peaks(file_path, best_params)
 
 
 def evaluate_panel(test_path, control_windows, mutation_map, control_positions=None, 
