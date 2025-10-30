@@ -24,7 +24,7 @@
 
 ### 1. 저장소 클론
 ```bash
-git clone https://github.com/your-username/autocalling_web.git
+git clone https://github.com/junfn1018-cmd/autocalling_web.git
 cd autocalling_web
 ```
 
@@ -119,6 +119,6 @@ autocalling_web/
 
 ---
 
-**개발자**: [Your Name]  
+**개발자**: [Kim]  
 **버전**: 1.0.0  
 **최종 업데이트**: 2025년 10월
